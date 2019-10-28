@@ -21,6 +21,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
 import java.text.{ DecimalFormat, DecimalFormatSymbols }
 import java.util.Locale
+import java.util.regex.Pattern
 
 import com.typesafe.config.Config
 import kamon.{ module, ClassLoading, Kamon }
@@ -72,13 +73,33 @@ class DatadogAgentReporter private[datadog] (@volatile private var config: Datad
       config.packetBuffer.appendMeasurement(gauge.name, config.measurementFormatter.formatMeasurement(encodeDatadogGauge(instrument.value, gauge.settings.unit), instrument.tags))
     }
 
+    val (histograms, distributions) =
+      if (config.enableDistribution)
+        (snapshot.histograms ++ snapshot.rangeSamplers ++ snapshot.timers).partition(d => config.distributionWhitelist.matcher(d.name).matches())
+      else
+        (snapshot.histograms ++ snapshot.rangeSamplers ++ snapshot.timers, Seq.empty)
+
+    // Report histograms-like metrics as datadog histograms
     for {
-      metric <- snapshot.histograms ++ snapshot.rangeSamplers ++ snapshot.timers
+      metric <- histograms
       instruments <- metric.instruments
       bucket <- instruments.value.bucketsIterator
     } {
 
       val bucketData = config.measurementFormatter.formatMeasurement(encodeDatadogHistogramBucket(bucket.value, bucket.frequency, metric.settings.unit), instruments.tags)
+      config.packetBuffer.appendMeasurement(metric.name, bucketData)
+    }
+
+    // Report histograms-like metrics as datadog distributions
+    // This is an experimental setting and may put a lot of stress on the local network interface (it sends
+    // one UDP packet per measurements, which can lead to a lot of traffic)
+    for {
+      metric <- distributions
+      instruments <- metric.instruments
+      bucket <- instruments.value.bucketsIterator
+      _ <- 1 to bucket.frequency
+    } {
+      val bucketData = config.measurementFormatter.formatMeasurement(encodeDatadogDistribution(bucket.value, metric.settings.unit), instruments.tags)
       config.packetBuffer.appendMeasurement(metric.name, bucketData)
     }
 
@@ -97,6 +118,9 @@ class DatadogAgentReporter private[datadog] (@volatile private var config: Datad
 
   private def encodeDatadogGauge(value: Double, unit: MeasurementUnit): String =
     valueFormat.format(scale(value, unit)) + "|g"
+
+  private def encodeDatadogDistribution(value: Long, unit: MeasurementUnit): String =
+    valueFormat.format(scale(value, unit)) + "|d"
 
   private def scale(value: Double, unit: MeasurementUnit): Double = unit.dimension match {
     case Time if unit.magnitude != config.timeUnit.magnitude          => MeasurementUnit.convert(value, unit, config.timeUnit)
@@ -147,7 +171,9 @@ object DatadogAgentReporter {
       timeUnit = readTimeUnit(datadogConfig.getString("time-unit")),
       informationUnit = readInformationUnit(datadogConfig.getString("information-unit")),
       measurementFormatter = getMeasurementFormatter(datadogConfig),
-      packetBuffer = getPacketBuffer(datadogConfig)
+      packetBuffer = getPacketBuffer(datadogConfig),
+      enableDistribution = datadogConfig.getBoolean("agent.enable-distributions"),
+      distributionWhitelist = getDistributionWhiteList(datadogConfig)
     )
   }
 
@@ -165,11 +191,21 @@ object DatadogAgentReporter {
     }
   }
 
+  private def getDistributionWhiteList(config: Config): Pattern = {
+    import scala.jdk.CollectionConverters._
+
+    val str = config.getStringList("agent.use-distributions-on").asScala.mkString("|")
+
+    Pattern.compile(str)
+  }
+
   private[datadog] case class Configuration(
-    timeUnit:             MeasurementUnit,
-    informationUnit:      MeasurementUnit,
-    measurementFormatter: MeasurementFormatter,
-    packetBuffer:         PacketBuffer
+    timeUnit:              MeasurementUnit,
+    informationUnit:       MeasurementUnit,
+    measurementFormatter:  MeasurementFormatter,
+    packetBuffer:          PacketBuffer,
+    enableDistribution:    Boolean,
+    distributionWhitelist: Pattern
   )
 
   trait PacketBuffer {
